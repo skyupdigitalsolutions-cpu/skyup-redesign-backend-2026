@@ -1,5 +1,59 @@
 const Contact = require("../models/contact.model");
 
+// ────────────────────────────────────────────────────────────────
+// CRM forwarding
+// Every saved lead is pushed to the CRM's /website-webhook endpoint
+// SERVER-SIDE, so delivery does not depend on the browser, GTM, or the
+// visitor keeping the tab open. Critical for paid (Google Ads) traffic.
+//
+// CRM webhook contract (reads EXACTLY these keys):
+//   webhook_secret, name, mobile, email, message
+//
+// Configure in backend .env:
+//   CRM_WEBHOOK_URL=https://your-crm-domain/website-webhook
+//   CRM_WEBHOOK_SECRET=your_real_secret
+// ────────────────────────────────────────────────────────────────
+async function forwardToCrm(contact) {
+  if (!process.env.CRM_WEBHOOK_URL) {
+    console.warn("⚠️  CRM_WEBHOOK_URL not set — lead NOT forwarded to CRM");
+    return;
+  }
+
+  // 8s safety timeout so a slow/unreachable CRM never hangs a dangling request.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+
+  try {
+    const res = await fetch(process.env.CRM_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        webhook_secret: process.env.CRM_WEBHOOK_SECRET,
+        name:    contact.name,
+        mobile:  contact.phone,
+        email:   contact.email,
+        message: contact.message,
+        source:  contact.service || "Website",
+      }),
+    });
+
+    if (!res.ok) {
+      console.error(
+        `❌ CRM webhook rejected lead (${contact.email}) — status ${res.status}:`,
+        await res.text().catch(() => "")
+      );
+    } else {
+      console.log(`✅ Lead forwarded to CRM: ${contact.email}`);
+    }
+  } catch (err) {
+    // Never throw — the lead is already safely saved in MongoDB.
+    console.error(`❌ CRM webhook error for ${contact.email}:`, err.message);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const getContacts = async (req, res) => {
   try {
     const contacts = await Contact.find({});
@@ -25,6 +79,11 @@ const getContact = async (req, res) => {
 const createContact = async (req, res) => {
   try {
     const contact = await Contact.create(req.body);
+
+    // Forward to CRM without blocking the visitor's response.
+    // (Lead is already saved, so we never await or fail on this.)
+    forwardToCrm(contact);
+
     res.status(201).json(contact);
   } catch (error) {
     res.status(400).json({ message: error.message });
